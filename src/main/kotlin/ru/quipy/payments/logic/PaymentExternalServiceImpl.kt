@@ -36,14 +36,15 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rateLimiterConfig = RateLimiterConfig.custom()
         .limitRefreshPeriod(Duration.ofMillis(10))
-        .limitForPeriod(40)
-        .timeoutDuration(Duration.ofSeconds(30))
+        .limitForPeriod(50)
+        .timeoutDuration(Duration.ofMillis(0))
         .build()
 
     private val rateLimiter = RateLimiterRegistry.of(rateLimiterConfig)
         .rateLimiter("payment-rate-limiter:$accountName")
 
-    private val responseExecutor = Executors.newFixedThreadPool(128)
+    private val dbExecutor = Executors.newFixedThreadPool(256)
+    private val responseExecutor = Executors.newFixedThreadPool(256)
 
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(5))
@@ -53,11 +54,21 @@ class PaymentExternalSystemAdapterImpl(
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
 
+        if (!rateLimiter.acquirePermission(1, Duration.ofMillis(0))) {
+            CompletableFuture.runAsync({
+                paymentESService.update(paymentId) {
+                    it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                    it.logProcessing(false, now(), transactionId, reason = "Rate limit exceeded")
+                }
+            }, dbExecutor)
+            return
+        }
+
         CompletableFuture.runAsync({
             paymentESService.update(paymentId) {
                 it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
-        }, responseExecutor)
+        }, dbExecutor)
 
         val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
 
@@ -69,21 +80,23 @@ class PaymentExternalSystemAdapterImpl(
 
         httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
             .whenComplete { response, throwable ->
-                if (throwable != null) {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = throwable.message ?: "Network error")
-                    }
-                } else {
-                    val body = try {
-                        mapper.readValue(response.body(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
+                CompletableFuture.runAsync({
+                    if (throwable != null) {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = throwable.message ?: "Network error")
+                        }
+                    } else {
+                        val body = try {
+                            mapper.readValue(response.body(), ExternalSysResponse::class.java)
+                        } catch (e: Exception) {
+                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                        }
 
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        }
                     }
-                }
+                }, dbExecutor)
             }
     }
 
