@@ -54,7 +54,7 @@ class PaymentExternalSystemAdapterImpl(
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
 
-        if (!rateLimiter.acquirePermission(1, Duration.ofMillis(0))) {
+        if (rateLimiter.reservePermission() < 0) {
             CompletableFuture.runAsync({
                 paymentESService.update(paymentId) {
                     it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
