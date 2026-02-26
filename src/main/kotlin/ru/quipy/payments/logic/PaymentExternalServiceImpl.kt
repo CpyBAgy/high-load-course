@@ -35,14 +35,14 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rateLimiterConfig = RateLimiterConfig.custom()
         .limitRefreshPeriod(Duration.ofMillis(10))
-        .limitForPeriod(11)
+        .limitForPeriod(40)
         .timeoutDuration(Duration.ofSeconds(30))
         .build()
 
     private val rateLimiter = RateLimiterRegistry.of(rateLimiterConfig)
         .rateLimiter("payment-rate-limiter:$accountName")
 
-    private val responseExecutor = Executors.newFixedThreadPool(32)
+    private val responseExecutor = Executors.newFixedThreadPool(256)
 
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(5))
