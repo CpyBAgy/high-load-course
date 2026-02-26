@@ -13,6 +13,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 
 
@@ -55,16 +56,20 @@ class PaymentExternalSystemAdapterImpl(
         try {
             rateLimiter.acquirePermission()
         } catch (e: io.github.resilience4j.ratelimiter.RequestNotPermitted) {
-            paymentESService.update(paymentId) {
-                it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-                it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout")
-            }
+            CompletableFuture.runAsync({
+                paymentESService.update(paymentId) {
+                    it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                    it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout")
+                }
+            }, responseExecutor)
             return
         }
 
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
+        CompletableFuture.runAsync({
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
+        }, responseExecutor)
 
         val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
 
