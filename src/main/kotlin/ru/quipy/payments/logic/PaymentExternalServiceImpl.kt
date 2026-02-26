@@ -53,18 +53,6 @@ class PaymentExternalSystemAdapterImpl(
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
 
-        try {
-            rateLimiter.acquirePermission()
-        } catch (e: io.github.resilience4j.ratelimiter.RequestNotPermitted) {
-            CompletableFuture.runAsync({
-                paymentESService.update(paymentId) {
-                    it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-                    it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout")
-                }
-            }, responseExecutor)
-            return
-        }
-
         CompletableFuture.runAsync({
             paymentESService.update(paymentId) {
                 it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
