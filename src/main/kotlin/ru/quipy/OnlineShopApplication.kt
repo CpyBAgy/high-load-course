@@ -18,5 +18,6 @@ class OnlineShopApplication {
 }
 
 fun main(args: Array<String>) {
+    System.setProperty("jdk.httpclient.connectionPoolSize", "5000")
     runApplication<OnlineShopApplication>(*args)
 }
