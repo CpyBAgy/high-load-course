@@ -33,12 +33,12 @@ class OrderPayer {
         TimeUnit.SECONDS,
         LinkedBlockingQueue(100_000),
         NamedThreadFactory("payment-submission-executor"),
-        ThreadPoolExecutor.DiscardOldestPolicy()
+        CallerBlockingRejectedExecutionHandler()
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-        paymentExecutor.submit {
+        paymentExecutor.execute {
             val createdEvent = paymentESService.create {
                 it.create(
                     paymentId,

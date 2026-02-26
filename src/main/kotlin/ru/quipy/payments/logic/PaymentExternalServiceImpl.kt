@@ -42,7 +42,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = RateLimiterRegistry.of(rateLimiterConfig)
         .rateLimiter("payment-rate-limiter:$accountName")
 
-    private val responseExecutor = Executors.newFixedThreadPool(256)
+    private val responseExecutor = Executors.newFixedThreadPool(128)
 
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(5))
@@ -55,7 +55,6 @@ class PaymentExternalSystemAdapterImpl(
         try {
             rateLimiter.acquirePermission()
         } catch (e: io.github.resilience4j.ratelimiter.RequestNotPermitted) {
-            logger.warn("[$accountName] Rate limit timeout for payment $paymentId")
             paymentESService.update(paymentId) {
                 it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
                 it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout")
@@ -78,14 +77,12 @@ class PaymentExternalSystemAdapterImpl(
         httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
             .whenComplete { response, throwable ->
                 if (throwable != null) {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", throwable)
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = throwable.message ?: "Network error")
                     }
                 } else {
-                    val bodyString = response.body()
                     val body = try {
-                        mapper.readValue(bodyString, ExternalSysResponse::class.java)
+                        mapper.readValue(response.body(), ExternalSysResponse::class.java)
                     } catch (e: Exception) {
                         ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                     }
