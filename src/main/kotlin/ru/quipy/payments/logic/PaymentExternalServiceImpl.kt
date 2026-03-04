@@ -75,7 +75,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = HttpClient(Java) {
         install(HttpTimeout) {
-            requestTimeoutMillis = 1000L
+            requestTimeoutMillis = 100L
         }
         engine {
             pipelining = true
@@ -105,26 +105,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private suspend fun bankPayment(transactionId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long) {
         val urlString = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
-        sendRequestWithRetry(transactionId, paymentId, urlString, paymentStartedAt)
-    }
-
-    private suspend fun sendRequestWithRetry(
-        transactionId: UUID,
-        paymentId: UUID,
-        url: String,
-        paymentStartedAt: Long,
-    ) {
-        val delayMs = 100L
-        val maxRetries = 3
-        var curRetry = 1
-
-        while (curRetry < maxRetries) {
-            if (sendRequest(transactionId, paymentId, url, paymentStartedAt)) {
-                return
-            }
-            delay(delayMs)
-            curRetry += 1
-        }
+        sendRequest(transactionId, paymentId, urlString, paymentStartedAt)
     }
 
     suspend fun sendRequest(
