@@ -7,6 +7,7 @@ import io.github.resilience4j.ratelimiter.RateLimiter
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.java.Java
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
@@ -73,6 +74,9 @@ class PaymentExternalSystemAdapterImpl(
     private val dispatcherPayment = Executors.newFixedThreadPool(60).asCoroutineDispatcher()
 
     private val client = HttpClient(Java) {
+        install(HttpTimeout) {
+            requestTimeoutMillis = 1000L
+        }
         engine {
             pipelining = true
             dispatcher = dispatcherClient

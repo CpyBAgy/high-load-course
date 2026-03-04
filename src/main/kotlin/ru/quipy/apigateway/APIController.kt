@@ -1,5 +1,6 @@
 package ru.quipy.apigateway
 
+import jakarta.servlet.http.HttpServletResponse
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -55,15 +56,25 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto {
+    fun payOrder(
+        @PathVariable orderId: UUID,
+        @RequestParam deadline: Long,
+        response: HttpServletResponse
+    ): PaymentSubmissionDto {
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
             it
         } ?: throw IllegalArgumentException("No such order $orderId")
 
-
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+
+        if (createdAt == -1L) {
+            response.addHeader("Retry-After", "30")
+            response.status = 503
+            return PaymentSubmissionDto(-1, paymentId)
+        }
+
         return PaymentSubmissionDto(createdAt, paymentId)
     }
 
