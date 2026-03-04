@@ -57,8 +57,7 @@ class APIController {
     }
 
     fun dropRequest(): ResponseEntity<PaymentSubmissionDto> {
-        val now = System.currentTimeMillis() + 30
-        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).header("Retry-After", now.toString()).build()
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).header("Retry-After", "30").build()
     }
 
     @PostMapping("/orders/{orderId}/payment")
