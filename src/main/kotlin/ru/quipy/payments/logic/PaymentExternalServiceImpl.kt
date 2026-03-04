@@ -75,7 +75,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = HttpClient(Java) {
         install(HttpTimeout) {
-            requestTimeoutMillis = 50L
+            requestTimeoutMillis = 1000L
         }
         engine {
             pipelining = true
