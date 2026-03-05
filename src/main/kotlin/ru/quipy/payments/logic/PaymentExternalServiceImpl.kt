@@ -70,8 +70,8 @@ class PaymentExternalSystemAdapterImpl(
         .publishPercentiles(0.9, 0.99, 0.999, 0.9999)
         .register(metricRegistry)
 
-    private val dispatcherClient = Executors.newFixedThreadPool(200).asCoroutineDispatcher()
-    private val dispatcherPayment = Executors.newFixedThreadPool(200).asCoroutineDispatcher()
+    private val dispatcherClient = Executors.newFixedThreadPool(60).asCoroutineDispatcher()
+    private val dispatcherPayment = Executors.newFixedThreadPool(60).asCoroutineDispatcher()
 
     private val client = HttpClient(Java) {
         install(HttpTimeout) {
