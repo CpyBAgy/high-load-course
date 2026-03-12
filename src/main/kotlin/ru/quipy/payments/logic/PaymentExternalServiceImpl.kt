@@ -146,16 +146,23 @@ class PaymentExternalSystemAdapterImpl(
 
     private fun handleTimeout(transactionId: UUID, paymentId: UUID, e: Exception) {
         logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-        paymentESService.update(paymentId) {
-            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+        CoroutineScope(dispatcherPayment + SupervisorJob()).launch {
+            try {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                }
+            } catch (_: Exception) {}
         }
     }
 
     private fun handleError(transactionId: UUID, paymentId: UUID, e: Exception) {
         logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-        paymentESService.update(paymentId) {
-            it.logProcessing(false, now(), transactionId, reason = e.message)
+        CoroutineScope(dispatcherPayment + SupervisorJob()).launch {
+            try {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = e.message)
+                }
+            } catch (_: Exception) {}
         }
     }
 
@@ -169,10 +176,12 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-        // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-        // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-        paymentESService.update(paymentId) {
-            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+        CoroutineScope(dispatcherPayment + SupervisorJob()).launch {
+            try {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                }
+            } catch (_: Exception) {}
         }
 
         return body.result
