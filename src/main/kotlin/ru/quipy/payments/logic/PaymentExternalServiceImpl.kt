@@ -51,8 +51,9 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val rateLimiter = RateLimiter.of("rate-limiter", RateLimiterConfig.custom()
-        .limitForPeriod(rateLimitPerSec)
-        .limitRefreshPeriod(Duration.ofMillis(1000))
+        .limitForPeriod(rateLimitPerSec / 10)
+        .limitRefreshPeriod(Duration.ofMillis(100))
+        .timeoutDuration(Duration.ofSeconds(30))
         .build()
     )
 
@@ -70,12 +71,12 @@ class PaymentExternalSystemAdapterImpl(
         .publishPercentiles(0.9, 0.99, 0.999, 0.9999)
         .register(metricRegistry)
 
-    private val dispatcherClient = Executors.newFixedThreadPool(60).asCoroutineDispatcher()
-    private val dispatcherPayment = Executors.newFixedThreadPool(60).asCoroutineDispatcher()
+    private val dispatcherClient = Executors.newFixedThreadPool(128).asCoroutineDispatcher()
+    private val dispatcherPayment = Executors.newFixedThreadPool(128).asCoroutineDispatcher()
 
     private val client = HttpClient(Java) {
         install(HttpTimeout) {
-            requestTimeoutMillis = 1000L
+            requestTimeoutMillis = 5000L
         }
         engine {
             pipelining = true
@@ -86,17 +87,18 @@ class PaymentExternalSystemAdapterImpl(
     private val semaphore = Semaphore(permits = parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
         val transactionId = UUID.randomUUID()
 
-        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        // Логируем submission асинхронно — не блокируем основной поток
+        CoroutineScope(dispatcherPayment + SupervisorJob()).launch {
+            try {
+                paymentESService.update(paymentId) {
+                    it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                }
+            } catch (e: Exception) {
+                logger.error("[$accountName] Failed to log submission for $paymentId", e)
+            }
         }
-
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         CoroutineScope(dispatcherPayment + SupervisorJob()).launch {
             bankPayment(transactionId, paymentId, amount, paymentStartedAt)
