@@ -48,13 +48,13 @@ class PaymentExternalSystemAdapterImpl(
         RateLimiterConfig.custom()
             .limitForPeriod(rateLimitPerSec)
             .limitRefreshPeriod(Duration.ofSeconds(1))
-            .timeoutDuration(Duration.ofSeconds(2))
+            .timeoutDuration(Duration.ofSeconds(3))
             .build()
     )
 
-    private val hedgeDelayMs = 400L
-    private val maxHedges = 5
-    private val paymentTimeout = 1400L
+    private val hedgeDelayMs = 150L
+    private val maxHedges = 8
+    private val requestTimeout = 1500L
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
@@ -66,46 +66,40 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         val completed = AtomicBoolean(false)
+        var success = false
+        var winningTxId = transactionId
 
         coroutineScope {
-            val jobs = mutableListOf<Job>()
+            val hedgeLauncher = launch {
+                repeat(maxHedges) { attempt ->
+                    if (completed.get()) return@launch
+                    if (attempt > 0) delay(hedgeDelayMs)
+                    if (completed.get()) return@launch
 
-            repeat(maxHedges) { attempt ->
-                if (attempt > 0) {
-                    delay(hedgeDelayMs)
-                }
-                if (completed.get()) return@repeat
+                    val hedgeTxId = if (attempt == 0) transactionId else UUID.randomUUID()
 
-                val hedgeTxId = if (attempt == 0) transactionId else UUID.randomUUID()
-
-                val job = launch {
-                    try {
-                        val result = sendSingleRequest(hedgeTxId, paymentId, amount)
-                        if (completed.compareAndSet(false, true)) {
-                            esWriterScope.esWriter.submit(paymentId) {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(result, now(), hedgeTxId, reason = if (result) "OK" else "Failed")
-                                }
+                    launch {
+                        try {
+                            val result = sendSingleRequest(hedgeTxId, paymentId, amount)
+                            if (result && completed.compareAndSet(false, true)) {
+                                success = true
+                                winningTxId = hedgeTxId
+                                this@coroutineScope.coroutineContext[Job]?.cancelChildren()
                             }
-                            jobs.forEach { j -> if (j != currentCoroutineContext()[Job]) j.cancel() }
+                        } catch (_: CancellationException) {
+                        } catch (e: Exception) {
+                            logger.debug("[$accountName] Hedge $attempt failed for $paymentId: ${e.message}")
                         }
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        logger.warn("[$accountName] Hedge attempt $attempt failed for $paymentId: ${e.message}")
                     }
                 }
-                jobs.add(job)
             }
 
-            jobs.joinAll()
+            hedgeLauncher.join()
+        }
 
-            if (!completed.get()) {
-                esWriterScope.esWriter.submit(paymentId) {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "All hedge attempts failed")
-                    }
-                }
+        esWriterScope.esWriter.submit(paymentId) {
+            paymentESService.update(paymentId) {
+                it.logProcessing(success, now(), winningTxId, reason = if (success) "OK" else "All hedges failed/timed out")
             }
         }
     }
@@ -118,7 +112,7 @@ class PaymentExternalSystemAdapterImpl(
             val request = HttpRequest.newBuilder()
                 .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
                 .POST(HttpRequest.BodyPublishers.noBody())
-                .timeout(Duration.ofMillis(paymentTimeout))
+                .timeout(Duration.ofMillis(requestTimeout))
                 .build()
 
             val response = client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
@@ -126,7 +120,7 @@ class PaymentExternalSystemAdapterImpl(
             val body = try {
                 mapper.readValue(response.body(), ExternalSysResponse::class.java)
             } catch (e: Exception) {
-                logger.error("[$accountName] [ERROR] txId: $transactionId, payment: $paymentId, code: ${response.statusCode()}, body: ${response.body()}")
+                logger.error("[$accountName] [ERROR] txId: $transactionId, payment: $paymentId, code: ${response.statusCode()}")
                 ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
             }
 
