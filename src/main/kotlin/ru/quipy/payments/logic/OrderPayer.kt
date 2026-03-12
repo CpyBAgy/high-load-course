@@ -1,6 +1,5 @@
 package ru.quipy.payments.logic
 
-import jakarta.annotation.PostConstruct
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
@@ -35,11 +34,11 @@ class OrderPayer {
     private lateinit var esWriterScope: EsWriterScope
 
     private val paymentExecutor = ThreadPoolExecutor(
-        50,
-        50,
+        100,
+        100,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(30_000),
+        LinkedBlockingQueue(50_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
