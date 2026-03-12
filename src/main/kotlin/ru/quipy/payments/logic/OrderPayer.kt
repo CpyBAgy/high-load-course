@@ -10,9 +10,6 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.common.utils.RateLimiter
-import ru.quipy.common.utils.TooManyRequestsException
-import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.config.EsWriterScope
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -37,9 +34,6 @@ class OrderPayer {
     @Autowired
     private lateinit var esWriterScope: EsWriterScope
 
-    private lateinit var rateLimiter: RateLimiter
-    private var retryAfter: Long = 0
-
     private val paymentExecutor = ThreadPoolExecutor(
         50,
         50,
@@ -52,28 +46,7 @@ class OrderPayer {
 
     private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
-    @PostConstruct
-    fun init() {
-        val accountProperties = paymentService.getAllAccountsProperties()
-        retryAfter = accountProperties.minOf { it.averageProcessingTime }.toMillis()
-        val externalServiceRps = accountProperties.minOf { it.rateLimitPerSec }
-
-        val safeQueueTimeSeconds = (1.0 - 0.01) * 0.8
-        val bucketSize = (externalServiceRps * safeQueueTimeSeconds).toInt()
-
-        rateLimiter = TokenBucketRateLimiter(
-            rate = externalServiceRps,
-            window = 1,
-            bucketMaxCapacity = bucketSize,
-            timeUnit = TimeUnit.SECONDS
-        )
-    }
-
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        if (!rateLimiter.tick()) {
-            throw TooManyRequestsException(retryAfter)
-        }
-
         val createdAt = System.currentTimeMillis()
 
         executorScope.launch {

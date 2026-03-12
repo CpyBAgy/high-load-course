@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.ratelimiter.RateLimiter
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
+import kotlinx.coroutines.*
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
@@ -16,6 +17,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.atomic.AtomicBoolean
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -46,14 +48,15 @@ class PaymentExternalSystemAdapterImpl(
         RateLimiterConfig.custom()
             .limitForPeriod(rateLimitPerSec)
             .limitRefreshPeriod(Duration.ofSeconds(1))
-            .timeoutDuration(Duration.ofSeconds(1))
+            .timeoutDuration(Duration.ofSeconds(2))
             .build()
     )
 
-    private val paymentTimeout = 1000L
+    private val hedgeDelayMs = 400L
+    private val maxHedges = 5
+    private val paymentTimeout = 1400L
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        val startTime = System.currentTimeMillis()
         val transactionId = UUID.randomUUID()
 
         esWriterScope.esWriter.submit(paymentId) {
@@ -62,46 +65,74 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        try {
-            semaphore.acquire()
-            try {
-                RateLimiter.waitForPermission(rateLimiter)
+        val completed = AtomicBoolean(false)
 
-                if (System.currentTimeMillis() - startTime >= paymentTimeout) {
-                    logger.warn("[$accountName] Deadline approaching, skipping $paymentId")
-                    return
+        coroutineScope {
+            val jobs = mutableListOf<Job>()
+
+            repeat(maxHedges) { attempt ->
+                if (attempt > 0) {
+                    delay(hedgeDelayMs)
                 }
+                if (completed.get()) return@repeat
 
-                val request = HttpRequest.newBuilder()
-                    .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
-                    .POST(HttpRequest.BodyPublishers.noBody())
-                    .timeout(Duration.ofMillis(paymentTimeout))
-                    .build()
+                val hedgeTxId = if (attempt == 0) transactionId else UUID.randomUUID()
 
-                val response = client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
-
-                val body = try {
-                    mapper.readValue(response.body(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                }
-
-                esWriterScope.esWriter.submit(paymentId) {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                val job = launch {
+                    try {
+                        val result = sendSingleRequest(hedgeTxId, paymentId, amount)
+                        if (completed.compareAndSet(false, true)) {
+                            esWriterScope.esWriter.submit(paymentId) {
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(result, now(), hedgeTxId, reason = if (result) "OK" else "Failed")
+                                }
+                            }
+                            jobs.forEach { j -> if (j != currentCoroutineContext()[Job]) j.cancel() }
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        logger.warn("[$accountName] Hedge attempt $attempt failed for $paymentId: ${e.message}")
                     }
                 }
-            } finally {
-                semaphore.release()
+                jobs.add(job)
             }
-        } catch (e: Exception) {
-            logger.error("[$accountName] Payment failed for $paymentId", e)
-            esWriterScope.esWriter.submit(paymentId) {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = e.message)
+
+            jobs.joinAll()
+
+            if (!completed.get()) {
+                esWriterScope.esWriter.submit(paymentId) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "All hedge attempts failed")
+                    }
                 }
             }
+        }
+    }
+
+    private suspend fun sendSingleRequest(transactionId: UUID, paymentId: UUID, amount: Int): Boolean {
+        semaphore.acquire()
+        try {
+            RateLimiter.waitForPermission(rateLimiter)
+
+            val request = HttpRequest.newBuilder()
+                .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .timeout(Duration.ofMillis(paymentTimeout))
+                .build()
+
+            val response = client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
+
+            val body = try {
+                mapper.readValue(response.body(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] [ERROR] txId: $transactionId, payment: $paymentId, code: ${response.statusCode()}, body: ${response.body()}")
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
+
+            return body.result
+        } finally {
+            semaphore.release()
         }
     }
 
