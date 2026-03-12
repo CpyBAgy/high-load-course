@@ -3,7 +3,6 @@ package ru.quipy.apigateway
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.orders.repository.OrderRepository
@@ -56,10 +55,6 @@ class APIController {
         PAID,
     }
 
-    fun dropRequest(): ResponseEntity<PaymentSubmissionDto> {
-        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).header("Retry-After", "30").build()
-    }
-
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
         val paymentId = UUID.randomUUID()
@@ -69,9 +64,6 @@ class APIController {
         } ?: throw IllegalArgumentException("No such order $orderId")
 
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-        if (createdAt == -1L) {
-            return dropRequest()
-        }
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
 
