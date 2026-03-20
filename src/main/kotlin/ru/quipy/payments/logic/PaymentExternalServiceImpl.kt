@@ -62,16 +62,16 @@ class PaymentExternalSystemAdapterImpl(
             .minimumNumberOfCalls(5)
             .failureRateThreshold(50f)
             .slowCallRateThreshold(80f)
-            .slowCallDurationThreshold(Duration.ofMillis(500))
-            .waitDurationInOpenState(Duration.ofSeconds(3))
+            .slowCallDurationThreshold(Duration.ofMillis(1500))
+            .waitDurationInOpenState(Duration.ofSeconds(1))
             .permittedNumberOfCallsInHalfOpenState(5)
             .automaticTransitionFromOpenToHalfOpenEnabled(true)
             .build()
     )
 
     private val requestTimeout = 2000L
-    private val maxRetries = 50
-    private val retryDelayMs = 500L
+    private val maxRetries = 5
+    private val retryDelayMs = 80L
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
@@ -86,6 +86,11 @@ class PaymentExternalSystemAdapterImpl(
         var lastReason = "Max retries exceeded"
 
         for (attempt in 0 until maxRetries) {
+            if (System.currentTimeMillis() + requestTimeout >= deadline) {
+                lastReason = "Deadline approaching"
+                break
+            }
+
             if (circuitBreaker.state == CircuitBreaker.State.OPEN) {
                 logger.debug("[$accountName] CB OPEN, waiting before retry for $paymentId (attempt $attempt)")
                 delay(retryDelayMs)
