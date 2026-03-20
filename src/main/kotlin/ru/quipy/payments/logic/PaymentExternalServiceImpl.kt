@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.ratelimiter.RateLimiter
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
+import kotlinx.coroutines.*
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
@@ -16,6 +17,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.atomic.AtomicBoolean
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -46,14 +48,15 @@ class PaymentExternalSystemAdapterImpl(
         RateLimiterConfig.custom()
             .limitForPeriod(rateLimitPerSec)
             .limitRefreshPeriod(Duration.ofSeconds(1))
-            .timeoutDuration(Duration.ofSeconds(1))
+            .timeoutDuration(Duration.ofSeconds(3))
             .build()
     )
 
-    private val paymentTimeout = 1000L
+    private val hedgeDelayMs = 150L
+    private val maxHedges = 8
+    private val requestTimeout = 1500L
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        val startTime = System.currentTimeMillis()
         val transactionId = UUID.randomUUID()
 
         esWriterScope.esWriter.submit(paymentId) {
@@ -62,46 +65,68 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        try {
-            semaphore.acquire()
-            try {
-                RateLimiter.waitForPermission(rateLimiter)
+        val completed = AtomicBoolean(false)
+        var success = false
+        var winningTxId = transactionId
 
-                if (System.currentTimeMillis() - startTime >= paymentTimeout) {
-                    logger.warn("[$accountName] Deadline approaching, skipping $paymentId")
-                    return
-                }
+        coroutineScope {
+            val hedgeLauncher = launch {
+                repeat(maxHedges) { attempt ->
+                    if (completed.get()) return@launch
+                    if (attempt > 0) delay(hedgeDelayMs)
+                    if (completed.get()) return@launch
 
-                val request = HttpRequest.newBuilder()
-                    .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
-                    .POST(HttpRequest.BodyPublishers.noBody())
-                    .timeout(Duration.ofMillis(paymentTimeout))
-                    .build()
+                    val hedgeTxId = if (attempt == 0) transactionId else UUID.randomUUID()
 
-                val response = client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
-
-                val body = try {
-                    mapper.readValue(response.body(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                }
-
-                esWriterScope.esWriter.submit(paymentId) {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    launch {
+                        try {
+                            val result = sendSingleRequest(hedgeTxId, paymentId, amount)
+                            if (result && completed.compareAndSet(false, true)) {
+                                success = true
+                                winningTxId = hedgeTxId
+                                this@coroutineScope.coroutineContext[Job]?.cancelChildren()
+                            }
+                        } catch (_: CancellationException) {
+                        } catch (e: Exception) {
+                            logger.debug("[$accountName] Hedge $attempt failed for $paymentId: ${e.message}")
+                        }
                     }
                 }
-            } finally {
-                semaphore.release()
             }
-        } catch (e: Exception) {
-            logger.error("[$accountName] Payment failed for $paymentId", e)
-            esWriterScope.esWriter.submit(paymentId) {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = e.message)
-                }
+
+            hedgeLauncher.join()
+        }
+
+        esWriterScope.esWriter.submit(paymentId) {
+            paymentESService.update(paymentId) {
+                it.logProcessing(success, now(), winningTxId, reason = if (success) "OK" else "All hedges failed/timed out")
             }
+        }
+    }
+
+    private suspend fun sendSingleRequest(transactionId: UUID, paymentId: UUID, amount: Int): Boolean {
+        semaphore.acquire()
+        try {
+            RateLimiter.waitForPermission(rateLimiter)
+
+            val request = HttpRequest.newBuilder()
+                .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .timeout(Duration.ofMillis(requestTimeout))
+                .build()
+
+            val response = client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
+
+            val body = try {
+                mapper.readValue(response.body(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] [ERROR] txId: $transactionId, payment: $paymentId, code: ${response.statusCode()}")
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
+
+            return body.result
+        } finally {
+            semaphore.release()
         }
     }
 
