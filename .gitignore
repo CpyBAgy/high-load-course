@@ -33,3 +33,9 @@ build/
 
 ### VS Code ###
 .vscode/
+tmp/
+
+### Project specific ###
+grafana/data/
+prometheus/data/
+pics/debug/

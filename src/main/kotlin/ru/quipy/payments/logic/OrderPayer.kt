@@ -1,11 +1,19 @@
 package ru.quipy.payments.logic
 
+import jakarta.annotation.PostConstruct
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
+import ru.quipy.common.utils.RateLimiter
+import ru.quipy.common.utils.TooManyRequestsException
+import ru.quipy.common.utils.TokenBucketRateLimiter
+import ru.quipy.config.EsWriterScope
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
@@ -26,28 +34,54 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
+    @Autowired
+    private lateinit var esWriterScope: EsWriterScope
+
+    private lateinit var rateLimiter: RateLimiter
+    private var retryAfter: Long = 0
+
     private val paymentExecutor = ThreadPoolExecutor(
-        32,
-        32,
+        50,
+        50,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(20_000),
+        LinkedBlockingQueue(30_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
 
-    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        val createdAt = System.currentTimeMillis()
-        paymentExecutor.submit {
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
-            }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+    private val executorScope = CoroutineScope(paymentExecutor.asCoroutineDispatcher())
 
+    @PostConstruct
+    fun init() {
+        val accountProperties = paymentService.getAllAccountsProperties()
+        retryAfter = accountProperties.minOf { it.averageProcessingTime }.toMillis()
+        val externalServiceRps = accountProperties.minOf { it.rateLimitPerSec }
+
+        val safeQueueTimeSeconds = (1.0 - 0.01) * 0.8
+        val bucketSize = (externalServiceRps * safeQueueTimeSeconds).toInt()
+
+        rateLimiter = TokenBucketRateLimiter(
+            rate = externalServiceRps,
+            window = 1,
+            bucketMaxCapacity = bucketSize,
+            timeUnit = TimeUnit.SECONDS
+        )
+    }
+
+    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+        if (!rateLimiter.tick()) {
+            throw TooManyRequestsException(retryAfter)
+        }
+
+        val createdAt = System.currentTimeMillis()
+
+        executorScope.launch {
+            esWriterScope.esWriter.submit(paymentId) {
+                paymentESService.create {
+                    it.create(paymentId, orderId, amount)
+                }
+            }
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
         return createdAt
