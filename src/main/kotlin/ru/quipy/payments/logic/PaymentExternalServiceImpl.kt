@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import io.github.resilience4j.ratelimiter.RateLimiter
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import kotlinx.coroutines.*
@@ -17,7 +19,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.TimeUnit
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -48,13 +50,28 @@ class PaymentExternalSystemAdapterImpl(
         RateLimiterConfig.custom()
             .limitForPeriod(rateLimitPerSec)
             .limitRefreshPeriod(Duration.ofSeconds(1))
-            .timeoutDuration(Duration.ofSeconds(3))
+            .timeoutDuration(Duration.ofSeconds(5))
             .build()
     )
 
-    private val hedgeDelayMs = 150L
-    private val maxHedges = 8
-    private val requestTimeout = 1500L
+    private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
+        "cb-$accountName",
+        CircuitBreakerConfig.custom()
+            .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+            .slidingWindowSize(20)
+            .minimumNumberOfCalls(5)
+            .failureRateThreshold(50f)
+            .slowCallRateThreshold(80f)
+            .slowCallDurationThreshold(Duration.ofMillis(1500))
+            .waitDurationInOpenState(Duration.ofSeconds(1))
+            .permittedNumberOfCallsInHalfOpenState(5)
+            .automaticTransitionFromOpenToHalfOpenEnabled(true)
+            .build()
+    )
+
+    private val requestTimeout = 2000L
+    private val maxRetries = 5
+    private val retryDelayMs = 80L
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
@@ -65,41 +82,54 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        val completed = AtomicBoolean(false)
         var success = false
-        var winningTxId = transactionId
+        var lastReason = "Max retries exceeded"
 
-        coroutineScope {
-            val hedgeLauncher = launch {
-                repeat(maxHedges) { attempt ->
-                    if (completed.get()) return@launch
-                    if (attempt > 0) delay(hedgeDelayMs)
-                    if (completed.get()) return@launch
-
-                    val hedgeTxId = if (attempt == 0) transactionId else UUID.randomUUID()
-
-                    launch {
-                        try {
-                            val result = sendSingleRequest(hedgeTxId, paymentId, amount)
-                            if (result && completed.compareAndSet(false, true)) {
-                                success = true
-                                winningTxId = hedgeTxId
-                                this@coroutineScope.coroutineContext[Job]?.cancelChildren()
-                            }
-                        } catch (_: CancellationException) {
-                        } catch (e: Exception) {
-                            logger.debug("[$accountName] Hedge $attempt failed for $paymentId: ${e.message}")
-                        }
-                    }
-                }
+        for (attempt in 0 until maxRetries) {
+            if (System.currentTimeMillis() + requestTimeout >= deadline) {
+                lastReason = "Deadline approaching"
+                break
             }
 
-            hedgeLauncher.join()
+            if (circuitBreaker.state == CircuitBreaker.State.OPEN) {
+                logger.debug("[$accountName] CB OPEN, waiting before retry for $paymentId (attempt $attempt)")
+                delay(retryDelayMs)
+                continue
+            }
+
+            if (!circuitBreaker.tryAcquirePermission()) {
+                delay(retryDelayMs)
+                continue
+            }
+
+            val callStart = System.currentTimeMillis()
+            try {
+                val result = sendSingleRequest(transactionId, paymentId, amount)
+                val callDuration = System.currentTimeMillis() - callStart
+
+                if (result) {
+                    circuitBreaker.onSuccess(callDuration, TimeUnit.MILLISECONDS)
+                    success = true
+                    break
+                } else {
+                    circuitBreaker.onError(callDuration, TimeUnit.MILLISECONDS, RuntimeException("Payment rejected by bank") as Throwable)
+                    lastReason = "Payment rejected"
+                    delay(retryDelayMs)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val callDuration = System.currentTimeMillis() - callStart
+                circuitBreaker.onError(callDuration, TimeUnit.MILLISECONDS, e as Throwable)
+                lastReason = e.message ?: "Unknown error"
+                logger.warn("[$accountName] Request failed for $paymentId (attempt $attempt): ${e.message}")
+                delay(retryDelayMs)
+            }
         }
 
         esWriterScope.esWriter.submit(paymentId) {
             paymentESService.update(paymentId) {
-                it.logProcessing(success, now(), winningTxId, reason = if (success) "OK" else "All hedges failed/timed out")
+                it.logProcessing(success, now(), transactionId, reason = if (success) "OK" else lastReason)
             }
         }
     }

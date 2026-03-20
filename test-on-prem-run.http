@@ -6,14 +6,14 @@ Content-Type: application/json
 {
   "serviceName": "{{serviceName}}",
   "token": "{{token}}",
-  "branch": "case-11",
-  "accounts": "acc-22",
+  "branch": "case-12",
+  "accounts": "acc-19",
   "ratePerSecond": 100,
-  "testCount": 20000,
-  "processingTimeMillis": 1500,
+  "testCount": 50000,
+  "processingTimeMillis": 10000000,
   "onPremises": true
 }
 
 ### Stop running test to save credits
 # @timeout 120
-POST http://77.234.215.138:31234/test/stop/cas-m3404-09
+POST http://77.234.215.138:31234/test/stop/m3403-8
